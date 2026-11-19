@@ -13,7 +13,7 @@
 use std::io::Write as _;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use winprint::printer::{PrinterDevice, WinPdfPrinter};
+use winprint::printer::{DxgiPrintContextError, GdiPdfPrinter, PrinterDevice, WinPdfPrinter, WinPdfPrinterError};
 use winprint::ticket::document::{NS_PSK, OwnedName, PrintCapabilitiesDocument, PrintFeature, PrintTicketDocument, reader::ParsableXmlDocument as _};
 use winprint::ticket::{FeatureOptionPack as _, PageMediaSize, PrintCapabilities, PrintTicket, PrintTicketBuilder};
 
@@ -93,16 +93,6 @@ fn two_sided(device: &PrinterDevice) -> Option<bool> {
     }
     .ok()?;
     ticket::two_sided(std::str::from_utf8(&xml).ok()?)
-}
-
-/// What the driver's PrintCapabilities offer for the job options [`ticket::verify_job_options`]
-/// checks; all unknown when they can't be read.
-fn driver_offers(device: &PrinterDevice) -> ticket::Offered {
-    let xml = {
-        let _provider = print_ticket_provider();
-        PrintCapabilities::fetch_xml_for_ticket(device, None)
-    };
-    xml.ok().and_then(|xml| String::from_utf8(xml).ok()).map_or_else(ticket::Offered::default, |xml| ticket::offered(&xml))
 }
 
 /// The queue the job goes to: the one asked for, else the default. Never another one: a job
@@ -200,7 +190,7 @@ pub(crate) fn settings_seed(job: &Job, printer: &str) -> Result<crate::Seed, Err
     }
 }
 
-fn driver_ticket(device: &PrinterDevice, job: &Job, sheet: (f64, f64), landscape: bool) -> Result<(PrintTicket, (u32, u32)), Error> {
+fn driver_ticket(device: &PrinterDevice, job: &Job, sheet: (f64, f64), landscape: bool) -> Result<(PrintTicket, (u32, u32), String), Error> {
     let chosen = chosen_settings(device, job)?;
     let chosen_xml = chosen.as_ref().map(|chosen| chosen.get_xml().to_vec());
     let capabilities_xml = {
@@ -282,30 +272,84 @@ fn driver_ticket(device: &PrinterDevice, job: &Job, sheet: (f64, f64), landscape
         builder.merge(PrintTicket::from(document)).map_err(spool_error)?;
         builder.build().map_err(spool_error)?
     };
-    let validated = in_drivers_spelling(device, built);
+    let validated = in_drivers_spelling(device, built, capabilities_xml);
     let xml = std::str::from_utf8(validated.get_xml()).map_err(spool_error)?;
     let paper = ticket::verify_ticket(xml, wanted, landscape)?;
     // A media type, resolution or quality the driver replaced to resolve a conflict with the job's paper.
     if let Some(chosen_xml) = &chosen_xml {
         ticket::verify_chosen_options(std::str::from_utf8(chosen_xml).map_err(spool_error)?, xml)?;
     }
-    Ok((validated, paper))
+    Ok((validated, paper, capabilities_xml.to_string()))
 }
 
 /// The ticket with the driver's vendor namespaces under the prefixes the driver declares them with
 /// ([`ticket::respell`]). Windows' merge renames them (`brpsk` to `ns0000`) when the merged ticket
 /// uses one of the driver's names, such as its own paper option, and a Brother driver then fails
-/// every page of the job with 0x80040003. The driver's prefixes are those of its own default ticket
-/// (an empty one, validated). The ticket as it is when they can't be read.
-fn in_drivers_spelling(device: &PrinterDevice, ticket: PrintTicket) -> PrintTicket {
-    let spelled = (|| {
+/// every page of the job with 0x80040003. Reuses the already-fetched PrintCapabilities XML when it
+/// declares all of the ticket's vendor namespaces, saving an extra PrintTicketBuilder round-trip.
+fn in_drivers_spelling(device: &PrinterDevice, ticket: PrintTicket, capabilities_xml: &str) -> PrintTicket {
+    let fast = (|| -> Option<PrintTicket> {
+        let xml = std::str::from_utf8(ticket.get_xml()).ok()?;
+        if ticket::missing_vendor_namespaces(xml, capabilities_xml) {
+            return None;
+        }
+        Some(ticket::respell(xml, capabilities_xml).map_or_else(|| ticket.clone(), PrintTicket::from_xml))
+    })();
+    if let Some(spelled) = fast {
+        return spelled;
+    }
+    let fallback = (|| {
         let _provider = print_ticket_provider();
         let mut builder = PrintTicketBuilder::new(device).ok()?;
         builder.merge(PrintTicket::from_xml(ticket::empty_ticket())).ok()?;
         let own = builder.build().ok()?;
         ticket::respell(std::str::from_utf8(ticket.get_xml()).ok()?, std::str::from_utf8(own.get_xml()).ok()?)
     })();
-    spelled.map_or(ticket, PrintTicket::from_xml)
+    fallback.map_or(ticket, PrintTicket::from_xml)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Xps,
+    Gdi,
+}
+
+fn choose_transport(xps_driver: Option<bool>, postscript: Option<bool>, prefer_gdi_raster: bool) -> Transport {
+    if xps_driver == Some(false) && (prefer_gdi_raster || postscript == Some(true)) { Transport::Gdi } else { Transport::Xps }
+}
+
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = err.to_string();
+    let mut cause = err.source();
+    while let Some(source) = cause {
+        message.push_str(": ");
+        message.push_str(&source.to_string());
+        cause = source.source();
+    }
+    message
+}
+
+fn should_fallback_to_gdi_message(chain: &str, pages_sent: usize, eligible: bool) -> bool {
+    if !eligible {
+        return false;
+    }
+    let lower = chain.to_ascii_lowercase();
+    // E_PRINTTICKET_FORMAT (0x80040003) rejects the package before anything prints;
+    // E_NOINTERFACE (0x80004002) and D2DERR_PRINT_FORMAT_NOT_SUPPORTED (0x8899002c) apply pre-page-1.
+    lower.contains("0x80040003") || (pages_sent == 0 && (lower.contains("0x80004002") || lower.contains("0x8899002c")))
+}
+
+fn should_fallback_to_gdi(err: &WinPdfPrinterError, pages_sent: usize) -> bool {
+    let eligible = matches!(
+        err,
+        WinPdfPrinterError::DxgiPrintContextError(
+            DxgiPrintContextError::FailedToStartJob(_)
+                | DxgiPrintContextError::FailedToClosePrintControl(_)
+                | DxgiPrintContextError::CompletionFailed(_)
+        ) | WinPdfPrinterError::RenderAtResolution { .. }
+            | WinPdfPrinterError::RenderError(_)
+    );
+    should_fallback_to_gdi_message(&error_chain(err), pages_sent, eligible)
 }
 
 /// The widest unprintable margin of the ticket's paper, in points; 0 when the driver doesn't say.
@@ -341,7 +385,7 @@ pub(crate) fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnM
     let read = &read;
     // The worker is joined before `dir` is dropped: the spooler reads the file.
     let result = crate::progress::run(progress, move |sender| {
-        let (mut ticket, mut paper) = driver_ticket(&device, job, first, landscape)?;
+        let (mut ticket, mut paper, capabilities_xml) = driver_ticket(&device, job, first, landscape)?;
         let xml = std::str::from_utf8(ticket.get_xml()).map_err(spool_error)?;
         let mut repeat = None;
         // Jobs of one copy each, for collated copies that can't be one job.
@@ -351,10 +395,10 @@ pub(crate) fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnM
         // can also keep a collation it doesn't offer, so collated copies always read them.
         let checked = ticket::verify_job_options(xml, job, count, ticket::Offered::default());
         if checked.is_err() || ticket::collated_copies(job, count) {
-            let offered = driver_offers(&device);
+            let offered = ticket::offered(&capabilities_xml);
             if ticket::repeats_collated(job, count, offered) {
                 let single = Job { copies: 1, ..job.clone() };
-                (ticket, paper) = driver_ticket(&device, &single, first, landscape)?;
+                (ticket, paper, _) = driver_ticket(&device, &single, first, landscape)?;
                 let xml = std::str::from_utf8(ticket.get_xml()).map_err(spool_error)?;
                 ticket::verify_job_options(xml, &single, count, offered)?;
                 // Two-sided as the driver will print it, the queue's default included.
@@ -385,47 +429,62 @@ pub(crate) fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnM
         if updated.is_none() && !edits.is_empty() {
             updated = Some(read.update(&edits)?);
         }
-        // The last point before anything reaches the spooler. Until then the job may wait on a
-        // driver (a sleeping printer can hold one for long), its own or another job's holding the
-        // provider, and a job cancelled meanwhile stops here and is never sent. winprint converts
-        // the ticket to a DEVMODE through the driver before it creates the native job, so that
-        // conversion is done here first, while the job can still be cancelled; the provider stays
-        // held until the first copy's own conversion has run, so no other job comes between them.
-        let mut first = Some(print_ticket_provider());
-        #[cfg(test)]
-        hold(job, HELD_CONVERSION_TITLE);
-        ticket.to_dev_mode(&device).map_err(spool_error)?;
+        // The last point before anything reaches the spooler. Convert the ticket to a DEVMODE
+        // once here (reused across all copies and by both WinPdfPrinter and GdiPdfPrinter) while
+        // the job can still be cancelled.
+        let dev_mode = {
+            let _provider = print_ticket_provider();
+            #[cfg(test)]
+            hold(job, HELD_CONVERSION_TITLE);
+            ticket.to_dev_mode(&device).map_err(spool_error)?
+        };
         cancel.start_sending()?;
         // Written once sending: a cancelled job leaves no copy of the document behind.
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(written)?;
         file.write_all(updated.as_deref().unwrap_or(pdf)).map_err(written)?;
         drop(file);
-        let printer = WinPdfPrinter::new(device);
+        let xps_driver = device.is_xps_driver().ok();
+        let postscript = if xps_driver == Some(false) && !read.content.prefer_gdi_raster() { device.is_postscript_driver().ok() } else { None };
+        let transport = choose_transport(xps_driver, postscript, read.content.prefer_gdi_raster());
+        let xps_printer = WinPdfPrinter::new(device.clone());
         let jobs = jobs as usize;
         for copy in 0..jobs {
-            // winprint converts the ticket to a DEVMODE through the provider before each job's
-            // first progress report, which releases the guard.
-            let mut provider = first.take().or_else(|| Some(print_ticket_provider()));
-            printer
-                .print_with_progress(&path, ticket.clone(), |processed, total| {
-                    drop(provider.take());
-                    // Page acceptance is distinct from terminal job success. The callback
-                    // drains on the submitter's thread, so it can retain non-Send UI state.
-                    let (processed, total) = (processed as usize, total as usize);
-                    let _ = sender.send((copy * total + processed, jobs * total));
-                })
-                .map_err(|e| {
-                    let mut message = e.to_string();
-                    let mut cause = std::error::Error::source(&e);
-                    while let Some(source) = cause {
-                        message.push_str(&format!(": {source}"));
-                        cause = source.source();
+            let format_copy_err = |err: &(dyn std::error::Error + 'static)| -> Error {
+                let mut message = error_chain(err);
+                if copy > 0 {
+                    message = format!("{copy} of {jobs} copies were sent, each as a job of its own, and the next was not: {message}");
+                }
+                spool_error(message)
+            };
+            let report_progress = |processed: u32, total: u32| {
+                // Page acceptance is distinct from terminal job success. The callback
+                // drains on the submitter's thread, so it can retain non-Send UI state.
+                let (processed, total) = (processed as usize, total as usize);
+                let _ = sender.send((copy * total + processed, jobs * total));
+            };
+            match transport {
+                Transport::Gdi => {
+                    GdiPdfPrinter::new(device.clone())
+                        .print_with_dev_mode_and_progress(&path, &dev_mode, report_progress)
+                        .map_err(|e| format_copy_err(&e))?;
+                }
+                Transport::Xps => {
+                    let mut sent_this_copy = 0usize;
+                    let xps_res = xps_printer.print_with_dev_mode_and_progress(&path, ticket.clone(), &dev_mode, |processed, total| {
+                        sent_this_copy = processed as usize;
+                        report_progress(processed, total);
+                    });
+                    if let Err(err) = xps_res {
+                        if should_fallback_to_gdi(&err, sent_this_copy) {
+                            GdiPdfPrinter::new(device.clone())
+                                .print_with_dev_mode_and_progress(&path, &dev_mode, report_progress)
+                                .map_err(|e| format_copy_err(&e))?;
+                        } else {
+                            return Err(format_copy_err(&err));
+                        }
                     }
-                    if copy > 0 {
-                        message = format!("{copy} of {jobs} copies were sent, each as a job of its own, and the next was not: {message}");
-                    }
-                    spool_error(message)
-                })?;
+                }
+            }
         }
         Ok((repeat, jobs))
     });
@@ -541,7 +600,7 @@ mod tests {
         let name = std::env::var("CRAFT_PRINT_TEST_PRINTER").unwrap();
         let device = select_device(PrinterDevice::all().unwrap(), Some(&name), None).unwrap();
         let job = Job { copies: 2, ..Job::default() };
-        let (ticket, paper) = driver_ticket(&device, &job, (612.0, 792.0), false).unwrap();
+        let (ticket, paper, _) = driver_ticket(&device, &job, (612.0, 792.0), false).unwrap();
         ticket::verify_job_options(std::str::from_utf8(ticket.get_xml()).unwrap(), &job, 1, ticket::Offered::default()).unwrap();
         assert_eq!(paper, (215_900, 279_400));
         // The ticket names the driver's vendor namespaces as the driver does (the merge renamed them).
@@ -569,7 +628,7 @@ mod tests {
             ("JobDuplexAllDocumentsContiguously", "TwoSidedLongEdge", Job { duplex: Some(crate::Duplex::LongEdge), ..Job::default() }),
             ("DocumentCollate", "Collated", Job { copies: 2, ..Job::default() }),
         ] {
-            let (ticket, _) = driver_ticket(&device, &requested, (612.0, 792.0), false).unwrap();
+            let (ticket, _, _) = driver_ticket(&device, &requested, (612.0, 792.0), false).unwrap();
             let retained = ticket::verify_job_options(std::str::from_utf8(ticket.get_xml()).unwrap(), &requested, 3, ticket::Offered::default());
             eprintln!("{feature}={wanted}: {retained:?}");
             let offered =
@@ -613,7 +672,7 @@ mod tests {
         .unwrap();
         let dev_mode = rgb::DevMode::from_bytes(crate::whole_dev_mode(bytes).unwrap()).unwrap();
         let job = Job { copies: 2, driver_settings: Some(crate::DriverSettings::new(device.name(), dev_mode.clone())), ..Job::default() };
-        let (ticket, paper) = driver_ticket(&device, &job, (612.0, 792.0), false).unwrap();
+        let (ticket, paper, _) = driver_ticket(&device, &job, (612.0, 792.0), false).unwrap();
         let xml = std::str::from_utf8(ticket.get_xml()).unwrap();
         eprintln!("{xml}");
         let capabilities = {
@@ -690,7 +749,34 @@ mod tests {
             colour(&builder.build().unwrap())
         };
         eprintln!("the preferences' colour: {preferences:?}");
-        let (ticket, _) = driver_ticket(&device, &Job::default(), (595.28, 841.89), false).unwrap();
+        let (ticket, _, _) = driver_ticket(&device, &Job::default(), (595.28, 841.89), false).unwrap();
         assert_eq!(colour(&ticket), preferences, "a job without grayscale keeps the preferences' colour");
+    }
+
+    #[test]
+    fn transport_routing_keeps_xps_for_v4_and_pcl_vectors_and_uses_gdi_for_v3_rasters_or_postscript() {
+        // v4 / XPS drivers always start on XPS, regardless of PDF content.
+        assert_eq!(choose_transport(Some(true), None, false), Transport::Xps);
+        assert_eq!(choose_transport(Some(true), None, true), Transport::Xps);
+        // Unknown driver type stays conservative on XPS.
+        assert_eq!(choose_transport(None, None, true), Transport::Xps);
+        // v3 non-PostScript (e.g. PCL6): pure vectors stay on crisp XPS vectors; transparency/scans use GDI.
+        assert_eq!(choose_transport(Some(false), Some(false), false), Transport::Xps);
+        assert_eq!(choose_transport(Some(false), None, true), Transport::Gdi);
+        // v3 PostScript driver uses fast GDI raster even for vectors.
+        assert_eq!(choose_transport(Some(false), Some(true), false), Transport::Gdi);
+        assert_eq!(choose_transport(Some(false), Some(true), true), Transport::Gdi);
+    }
+
+    #[test]
+    fn fallback_to_gdi_triggers_only_on_ticket_rejection_or_pre_page_1_interface_format_errors() {
+        assert!(should_fallback_to_gdi_message("Failed to close print control: (0x80040003)", 1, true));
+        assert!(should_fallback_to_gdi_message("Failed to start job: No such interface (0x80004002)", 0, true));
+        assert!(should_fallback_to_gdi_message("AddPage: (0x8899002C)", 0, true));
+        // Once page 1 has started accepting pages, non-ticket errors must NOT retry as a duplicate job.
+        assert!(!should_fallback_to_gdi_message("AddPage: No such interface (0x80004002)", 1, true));
+        assert!(!should_fallback_to_gdi_message("AddPage: (0x8899002C)", 2, true));
+        assert!(!should_fallback_to_gdi_message("Printer offline (0x80070005)", 0, true));
+        assert!(!should_fallback_to_gdi_message("Failed to close print control: (0x80040003)", 0, false));
     }
 }

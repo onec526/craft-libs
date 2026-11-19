@@ -510,3 +510,127 @@ fn an_object_stream_header_past_the_token_limit_exhausts_the_budget() {
     assert!(reader.load_objstm(6).is_none());
     assert!(reader.budget.exhausted);
 }
+
+fn pdf_from_objects(objects: &[String]) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let mut offsets = vec![0usize];
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f\r\n", objects.len() + 1).as_bytes());
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+    pdf
+}
+
+#[test]
+fn content_profile_classifies_opaque_vectors_and_bare_transparency_groups_as_vector() {
+    let vec_pdf = fixture("3 0 R", false, "");
+    assert_eq!(read(&vec_pdf).unwrap().content, ContentProfile { has_transparency: false, has_large_raster: false });
+
+    // A bare Word-style /Group << /S /Transparency >> with opaque graphics stays vector.
+    let group_pdf = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 26 >>\nstream\n0 0 0 rg 36 36 72 72 re f\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /ExtGState << /G0 << /Type /ExtGState /ca 1.0 /BM /Normal /SMask /None >> >> >> /Group << /S /Transparency /CS /DeviceRGB >> /MediaBox [0 0 612 792] /Contents 3 0 R >>".into(),
+    ]);
+    assert_eq!(read(&group_pdf).unwrap().content, ContentProfile { has_transparency: false, has_large_raster: false });
+}
+
+#[test]
+fn content_profile_ignores_small_logos_and_flags_large_or_cumulative_rasters() {
+    let small_logo = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 12 >>\nstream\n/Im0 Do\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>".into(),
+        "<< /Type /XObject /Subtype /Image /Width 200 /Height 100 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 0 >>\nstream\n\nendstream"
+            .into(),
+    ]);
+    assert_eq!(read(&small_logo).unwrap().content, ContentProfile { has_transparency: false, has_large_raster: false });
+
+    let large_scan = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 12 >>\nstream\n/Im0 Do\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>".into(),
+        "<< /Type /XObject /Subtype /Image /Width 2480 /Height 3508 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 0 >>\nstream\n\nendstream"
+            .into(),
+    ]);
+    assert_eq!(read(&large_scan).unwrap().content, ContentProfile { has_transparency: false, has_large_raster: true });
+
+    let tiled_raster = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 12 >>\nstream\n/Im0 Do\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>".into(),
+        "<< /Type /XObject /Subtype /Image /Width 2000 /Height 2000 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 0 >>\nstream\n\nendstream"
+            .into(),
+    ]);
+    assert_eq!(read(&tiled_raster).unwrap().content, ContentProfile { has_transparency: false, has_large_raster: true });
+
+    // Cumulative >= 1,000,000 px across medium tiles triggers has_large_raster.
+    let cumulative = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 20 >>\nstream\n/Im0 Do /Im1 Do\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 5 0 R /Im1 5 0 R /Im2 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>"
+            .into(),
+        "<< /Type /XObject /Subtype /Image /Width 600 /Height 600 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 0 >>\nstream\n\nendstream"
+            .into(),
+    ]);
+    assert_eq!(read(&cumulative).unwrap().content, ContentProfile { has_transparency: false, has_large_raster: true });
+}
+
+#[test]
+fn content_profile_detects_extgstate_smask_and_nested_form_transparency() {
+    for gs in ["<< /ca 0.5 >>", "<< /CA 0.8 >>", "<< /BM /Multiply >>", "<< /BM [/Normal /Screen] >>", "<< /SMask << /S /Alpha >> >>"] {
+        let pdf = pdf_from_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+            "<< /Length 12 >>\nstream\n/GS0 gs\nendstream".into(),
+            format!("<< /Type /Page /Parent 2 0 R /Resources << /ExtGState << /GS0 {gs} >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>"),
+        ]);
+        let prof = read(&pdf).unwrap().content;
+        assert!(prof.has_transparency, "expected transparency for {gs}");
+        assert!(prof.prefer_gdi_raster());
+    }
+
+    let img_smask = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 12 >>\nstream\n/Im0 Do\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im0 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>".into(),
+        "<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /SMask 6 0 R /Length 0 >>\nstream\n\nendstream".into(),
+        "<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /Length 0 >>\nstream\n\nendstream".into(),
+    ]);
+    assert!(read(&img_smask).unwrap().content.has_transparency);
+
+    // Nested Form XObject carrying alpha / large image.
+    let nested_form = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 12 >>\nstream\n/Fm0 Do\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Fm0 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>".into(),
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /ExtGState << /G1 6 0 R >> >> /Length 0 >>\nstream\n\nendstream".into(),
+        "<< /ca 0.25 >>".into(),
+    ]);
+    assert!(read(&nested_form).unwrap().content.has_transparency);
+}
+
+#[test]
+fn content_profile_survives_cyclic_form_references() {
+    let cyclic = pdf_from_objects(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [4 0 R] /Count 1 >>".into(),
+        "<< /Length 12 >>\nstream\n/Fm0 Do\nendstream".into(),
+        "<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Fm0 5 0 R >> >> /MediaBox [0 0 612 792] /Contents 3 0 R >>".into(),
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Fm0 5 0 R >> >> /Length 0 >>\nstream\n\nendstream".into(),
+    ]);
+    assert_eq!(read(&cyclic).unwrap().content, ContentProfile { has_transparency: false, has_large_raster: false });
+}

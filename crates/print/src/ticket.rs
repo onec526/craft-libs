@@ -659,6 +659,15 @@ fn vendor_prefixes(document: &roxmltree::Document<'_>) -> Vec<(String, String)> 
         .collect()
 }
 
+/// Whether `ticket` declares any vendor namespace URI absent from `reference` (such as the
+/// driver's `PrintCapabilities` XML), or either document fails to parse.
+pub(crate) fn missing_vendor_namespaces(ticket: &str, reference: &str) -> bool {
+    let Ok(ticket_doc) = crate::xml::parse(ticket) else { return true };
+    let Ok(reference_doc) = crate::xml::parse(reference) else { return true };
+    let reference_uris = vendor_prefixes(&reference_doc);
+    vendor_prefixes(&ticket_doc).into_iter().any(|(_, uri)| !reference_uris.iter().any(|(_, ref_uri)| *ref_uri == uri))
+}
+
 /// Whether every prefix in a `name` or `constrained` attribute or a QName value of the ticket is
 /// declared: the XML parser does not check a prefix inside an attribute value.
 fn prefixes_resolve(document: &roxmltree::Document<'_>) -> bool {
@@ -1857,5 +1866,32 @@ mod tests {
             assert_eq!(one_job_sides(&finishing("None")), Some(true), "{feature}");
             assert_eq!(one_job_sides(&finishing("StapleTopLeft")), None, "{feature}");
         }
+    }
+
+    #[test]
+    fn capabilities_xml_covers_and_respells_vendor_namespaces_without_empty_ticket_roundtrip() {
+        let capabilities = format!(
+            r#"<psf:PrintCapabilities version="1" xmlns:psf="{NS_PSF}" xmlns:psk="{NS_PSK}" xmlns:brpsk="http://schemas.brother.example/pt" xmlns:xsi="{NS_XSI}" xmlns:xsd="{NS_XSD}">
+<psf:Feature name="brpsk:JobPrintSpeed"><psf:Option name="brpsk:Normal"/></psf:Feature>
+</psf:PrintCapabilities>"#
+        );
+        let merged = format!(
+            r#"<psf:PrintTicket version="1" xmlns:psf="{NS_PSF}" xmlns:psk="{NS_PSK}" xmlns:ns0000="http://schemas.brother.example/pt" xmlns:xsi="{NS_XSI}" xmlns:xsd="{NS_XSD}">
+<psf:Feature name="ns0000:JobPrintSpeed"><psf:Option name="ns0000:Normal"/></psf:Feature>
+</psf:PrintTicket>"#
+        );
+        assert!(!missing_vendor_namespaces(&merged, &capabilities));
+        let fixed = respell(&merged, &capabilities).expect("respell should rewrite ns0000 to brpsk");
+        assert!(fixed.contains("xmlns:brpsk=\"http://schemas.brother.example/pt\""));
+        assert!(fixed.contains("name=\"brpsk:JobPrintSpeed\""));
+        assert!(!fixed.contains("ns0000:"));
+
+        let unknown_vendor = format!(
+            r#"<psf:PrintTicket version="1" xmlns:psf="{NS_PSF}" xmlns:psk="{NS_PSK}" xmlns:ns0001="http://schemas.other.example/extra">
+<psf:Feature name="ns0001:Extra"/>
+</psf:PrintTicket>"#
+        );
+        assert!(missing_vendor_namespaces(&unknown_vendor, &capabilities));
+        assert!(missing_vendor_namespaces("<broken", &capabilities));
     }
 }

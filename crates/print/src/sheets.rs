@@ -899,10 +899,24 @@ impl Sheet {
     }
 }
 
+/// Summary of transparency and large raster images found while reading a print-ready PDF's sheets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContentProfile {
+    pub has_transparency: bool,
+    pub has_large_raster: bool,
+}
+
+impl ContentProfile {
+    pub(crate) fn prefer_gdi_raster(self) -> bool {
+        self.has_transparency || self.has_large_raster
+    }
+}
+
 /// A print-ready PDF's sheets, and what an update to it needs.
 pub(crate) struct Sheets<'a> {
     data: &'a [u8],
     pub(crate) sheets: Vec<Sheet>,
+    pub(crate) content: ContentProfile,
     trailer: Dict,
     catalog: Dict,
     /// The newest cross-reference section is a stream (so is the update's).
@@ -910,6 +924,195 @@ pub(crate) struct Sheets<'a> {
     startxref: usize,
     /// The first unused object number.
     size: u32,
+}
+
+const SCAN_MAX_OBJECTS: usize = 4096;
+const SCAN_MAX_DEPTH: usize = 4;
+const LARGE_IMAGE_PIXELS: u64 = 500_000;
+const PAGE_RASTER_PIXELS: u64 = 1_000_000;
+
+struct ContentScanner {
+    steps: usize,
+    profile: ContentProfile,
+    resource_cache: HashMap<u32, ContentProfile>,
+    active_forms: HashSet<u32>,
+}
+
+impl ContentScanner {
+    fn new() -> Self {
+        Self { steps: 0, profile: ContentProfile::default(), resource_cache: HashMap::new(), active_forms: HashSet::new() }
+    }
+
+    fn exhausted(&self, reader: &Reader<'_>) -> bool {
+        self.steps >= SCAN_MAX_OBJECTS || reader.budget.exhausted
+    }
+
+    fn is_opaque_blend_mode(name: &[u8]) -> bool {
+        name == b"Normal" || name == b"Compatible"
+    }
+
+    fn inspect_resources(&mut self, reader: &mut Reader<'_>, res_obj: &Obj, depth: usize, out: &mut ContentProfile, page_pixels: &mut u64) {
+        if depth > SCAN_MAX_DEPTH || self.exhausted(reader) || (out.has_transparency && out.has_large_raster) {
+            return;
+        }
+        self.steps += 1;
+        let Some(res_resolved) = reader.resolve(res_obj) else {
+            return;
+        };
+        let Some(res_dict) = res_resolved.dict() else {
+            return;
+        };
+
+        if let Some(gs_entry) = get(res_dict, b"ExtGState")
+            && let Some(gs_resolved) = reader.resolve(gs_entry)
+            && let Some(gs_map) = gs_resolved.dict()
+        {
+            self.steps += 1;
+            for (_, gs_ref) in gs_map {
+                if self.exhausted(reader) || out.has_transparency {
+                    break;
+                }
+                self.steps += 1;
+                let Some(gs_obj) = reader.resolve(gs_ref) else {
+                    continue;
+                };
+                let Some(gs) = gs_obj.dict() else {
+                    continue;
+                };
+                if let Some(ca) = get(gs, b"ca").and_then(|v| reader.resolve(v)).and_then(|o| o.num())
+                    && ca < 1.0
+                {
+                    out.has_transparency = true;
+                }
+                if let Some(ca_stroke) = get(gs, b"CA").and_then(|v| reader.resolve(v)).and_then(|o| o.num())
+                    && ca_stroke < 1.0
+                {
+                    out.has_transparency = true;
+                }
+                if let Some(bm) = get(gs, b"BM").and_then(|v| reader.resolve(v)) {
+                    match &bm {
+                        Obj::Name(name) if !Self::is_opaque_blend_mode(name) => out.has_transparency = true,
+                        Obj::Array(items) => {
+                            for item in items {
+                                if self.exhausted(reader) {
+                                    break;
+                                }
+                                if let Some(resolved) = reader.resolve(item)
+                                    && let Some(name) = resolved.name()
+                                    && !Self::is_opaque_blend_mode(name)
+                                {
+                                    out.has_transparency = true;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(smask) = get(gs, b"SMask").and_then(|v| reader.resolve(v))
+                    && smask.dict().is_some()
+                {
+                    out.has_transparency = true;
+                }
+            }
+        }
+
+        if let Some(xo_entry) = get(res_dict, b"XObject")
+            && let Some(xo_resolved) = reader.resolve(xo_entry)
+            && let Some(xo_map) = xo_resolved.dict()
+        {
+            self.steps += 1;
+            for (_, xo_ref) in xo_map {
+                if self.exhausted(reader) || (out.has_transparency && out.has_large_raster) {
+                    break;
+                }
+                self.steps += 1;
+                let form_id = match xo_ref {
+                    Obj::Ref(num, _) => {
+                        if self.active_forms.contains(num) {
+                            continue;
+                        }
+                        Some(*num)
+                    }
+                    _ => None,
+                };
+                let Some(xo_obj) = reader.resolve(xo_ref) else {
+                    continue;
+                };
+                let Some(xo) = xo_obj.dict() else {
+                    continue;
+                };
+                let subtype = get(xo, b"Subtype").and_then(|s| reader.resolve(s));
+                match subtype.as_ref().and_then(Obj::name) {
+                    Some(b"Image") => {
+                        if let Some(sm) = get(xo, b"SMask").and_then(|v| reader.resolve(v))
+                            && !matches!(sm, Obj::Null)
+                        {
+                            out.has_transparency = true;
+                        }
+                        if get(xo, b"SMaskInData").and_then(|v| reader.resolve(v)).and_then(|o| o.int()).is_some_and(|n| n != 0) {
+                            out.has_transparency = true;
+                        }
+                        let w = get(xo, b"Width").and_then(|v| reader.resolve(v)).and_then(|o| o.int()).and_then(|n| u64::try_from(n).ok());
+                        let h = get(xo, b"Height").and_then(|v| reader.resolve(v)).and_then(|o| o.int()).and_then(|n| u64::try_from(n).ok());
+                        if let (Some(w), Some(h)) = (w, h) {
+                            let px = w.saturating_mul(h);
+                            if px >= LARGE_IMAGE_PIXELS {
+                                out.has_large_raster = true;
+                            }
+                            *page_pixels = page_pixels.saturating_add(px);
+                            if *page_pixels >= PAGE_RASTER_PIXELS {
+                                out.has_large_raster = true;
+                            }
+                        }
+                    }
+                    Some(b"Form") => {
+                        if depth < SCAN_MAX_DEPTH
+                            && let Some(sub_res) = get(xo, b"Resources")
+                        {
+                            if let Some(id) = form_id {
+                                self.active_forms.insert(id);
+                            }
+                            self.inspect_resources(reader, sub_res, depth + 1, out, page_pixels);
+                            if let Some(id) = form_id {
+                                self.active_forms.remove(&id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn scan_sheets(&mut self, reader: &mut Reader<'_>, sheet_resources: &[Option<Arc<Obj>>]) -> ContentProfile {
+        for res_opt in sheet_resources {
+            if self.exhausted(reader) || (self.profile.has_transparency && self.profile.has_large_raster) {
+                break;
+            }
+            let Some(res_obj) = res_opt else {
+                continue;
+            };
+            if let Obj::Ref(res_num, _) = res_obj.as_ref()
+                && let Some(cached) = self.resource_cache.get(res_num)
+            {
+                self.profile.has_transparency |= cached.has_transparency;
+                self.profile.has_large_raster |= cached.has_large_raster;
+                continue;
+            }
+            let mut page_prof = ContentProfile::default();
+            let mut page_pixels = 0u64;
+            self.inspect_resources(reader, res_obj, 0, &mut page_prof, &mut page_pixels);
+            if let Obj::Ref(res_num, _) = res_obj.as_ref()
+                && !self.exhausted(reader)
+            {
+                self.resource_cache.insert(*res_num, page_prof);
+            }
+            self.profile.has_transparency |= page_prof.has_transparency;
+            self.profile.has_large_raster |= page_prof.has_large_raster;
+        }
+        self.profile
+    }
 }
 
 /// What [`read`] inherits down the page tree.
@@ -959,6 +1162,7 @@ pub(crate) fn read(data: &[u8]) -> Result<Sheets<'_>, Error> {
     let pages_root = get(&catalog, b"Pages").cloned().ok_or_else(|| unreadable("no page tree"))?;
 
     let mut sheets = Vec::new();
+    let mut sheet_resources: Vec<Option<Arc<Obj>>> = Vec::new();
     let mut visited = HashSet::new();
     // Depth-first in page order: kids are pushed last to first.
     let mut stack = vec![(pages_root, Inherited::default(), 0usize)];
@@ -1054,6 +1258,7 @@ pub(crate) fn read(data: &[u8]) -> Result<Sheets<'_>, Error> {
             Some(_) => true,
         };
         let resources = if own_resources { None } else { parent_resources };
+        sheet_resources.push(here.resources);
         sheets.push(Sheet { obj, dict, media, bounds, resources, rotate, print_annotations_safe, annotated });
     }
     if reader.budget.exhausted {
@@ -1062,7 +1267,10 @@ pub(crate) fn read(data: &[u8]) -> Result<Sheets<'_>, Error> {
     if sheets.is_empty() {
         return Err(Error::Spool("the print-ready PDF has no pages".into()));
     }
-    Ok(Sheets { data, sheets, trailer, catalog, xref_stream, startxref: start, size })
+    // Scan resources under an isolated budget so complex resources never trip the page-tree limit.
+    reader.budget = Budget::default();
+    let content = ContentScanner::new().scan_sheets(&mut reader, &sheet_resources);
+    Ok(Sheets { data, sheets, content, trailer, catalog, xref_stream, startxref: start, size })
 }
 
 /// How sheets of another size than the paper are printed.
